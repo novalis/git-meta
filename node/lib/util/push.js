@@ -81,14 +81,20 @@ exports.push = co.wrap(function *(repo, remoteName, source, target, force) {
     assert.isString(target);
     assert.isBoolean(force);
 
-    let remote;
-    try {
-        remote = yield repo.getRemote(remoteName);
+    let remoteUrl;
+    if (remoteName.startsWith("http:") || remoteName.startsWith("https:") ||
+        remoteName.includes("@")) {
+        remoteUrl = remoteName;
+    } else {
+        let remote;
+        try {
+            remote = yield repo.getRemote(remoteName);
+        }
+        catch (e) {
+            throw new UserError(`No remote named ${colors.red(remoteName)}.`);
+        }
+        remoteUrl = yield GitUtil.getRemoteUrl(repo, remote);
     }
-    catch (e) {
-        throw new UserError(`No remote named ${colors.red(remoteName)}.`);
-    }
-    const remoteUrl = yield GitUtil.getRemoteUrl(repo, remote);
 
     // First, push the submodules.
 
