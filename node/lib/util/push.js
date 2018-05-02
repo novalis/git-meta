@@ -84,23 +84,75 @@ exports.push = co.wrap(function *(repo, remoteName, source, target, force) {
     let remoteUrl = yield GitUtil.getUrlFromRemoteName(repo, remoteName);
 
     // First, push the submodules.
+    const annotatedCommit = yield GitUtil.resolveCommitish(repo, source);
+    const sha = annotatedCommit.id();
+    const commit = yield repo.getCommit(sha);
+
+    const submoduleSet = new Set(yield SubmoduleUtil.listOpenSubmodules(repo));
+    for (const s of yield SubmoduleUtil.listAbsorbedSubmodules(repo)) {
+        submoduleSet.add(s);
+    }
+    const submodules = [...submoduleSet];
+    const pushMap = yield SubmoduleUtil.getSubmoduleShasForCommit(repo,
+                                                                  submodules,
+                                                                  commit);
+    const trackingBranches = new Set();
+    trackingBranches.add(`refs/remotes/${remoteName}/${target}`);
+    let tracking;
+    try {
+        const sourceBranch = yield repo.getReference(source);
+        tracking = yield GitUtil.getTrackingInfo(repo, sourceBranch);
+    } catch (e) {
+        // we have no local branch? maybe source is a sha.
+        tracking = null;
+    }
+
+    if (tracking !== null) {
+        if (tracking.remoteName !== null) {
+            trackingBranches.add(
+                `refs/remotes/${remoteName}/${tracking.remoteName}`);
+        }
+        if (tracking.pushRemoteName !== null) {
+            trackingBranches.add(
+                `refs/remotes/${remoteName}/${tracking.pushRemoteName}`);
+        }
+    }
+
+    for (const branch of trackingBranches) {
+        const annotated = yield GitUtil.resolveCommitish(repo, branch);
+
+        if (annotated !== null) {
+            const trackingCommit = yield NodeGit.Commit.lookup(repo,
+                                                               annotated.id());
+            const tree = yield trackingCommit.getTree();
+            for (const sub of Object.keys(pushMap)) {
+                let entry;
+                try {
+                    entry = yield tree.entryByPath(sub);
+                } catch (e) {
+                    //not found, OK
+                    continue;
+                }
+                // easy check: does the tracking branch's id equal the one
+                // in the pushMap?  If not, it would be possible that the
+                // tracking branch were *ahead*, but this is so unlikely as
+                // to be not worth opening up the repo to check
+                if (entry.id() === pushMap[sub]) {
+                    delete pushMap[sub];
+                }
+            }
+        }
+    }
 
     let errorMessage = "";
-    const shas = yield SubmoduleUtil.getSubmoduleShasForCommitish(repo,
-                                                                   source);
-    const annotatedCommit = yield GitUtil.resolveCommitish(repo, source);
-    const commit = yield repo.getCommit(annotatedCommit.id());
+
     const urls = yield SubmoduleConfigUtil.getSubmodulesFromCommit(repo,
                                                                    commit);
 
     const pushSub = co.wrap(function *(subName) {
-        // If no commit for a submodule on this branch, skip it.
-        if (!(subName in shas)) {
-            return;                                                   // RETURN
-        }
         // Push to a synthetic branch; first, calculate name.
 
-        const sha = shas[subName];
+        const sha = pushMap[subName];
         const syntheticName =
                           SyntheticBranchUtil.getSyntheticBranchForCommit(sha);
         const subRepo = yield SubmoduleUtil.getRepo(repo, subName);
@@ -126,8 +178,7 @@ exports.push = co.wrap(function *(repo, remoteName, source, target, force) {
            `Failed to push submodule ${colors.yellow(subName)}: ${pushResult}`;
         }
     });
-    const subRepos = yield SubmoduleUtil.listOpenSubmodules(repo);
-    yield DoWorkQueue.doInParallel(subRepos, pushSub);
+    yield DoWorkQueue.doInParallel(Object.keys(pushMap), pushSub);
 
     // Throw an error if there were any problems pushing submodules; don't push
     // the meta-repo.
